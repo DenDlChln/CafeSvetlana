@@ -20,7 +20,7 @@ def load_config():
             config["admin_chat_id"] = int(config["admin_chat_id"])
             return config
     except Exception as e:
-        logging.error(f"❌ config.json ошибка: {e}")
+        logging.error(f"config.json ошибка: {e}")
         return {}
 
 CAFE = load_config()
@@ -45,7 +45,7 @@ load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN or ' ' in TOKEN:
-    print("❌ TELEGRAM_TOKEN не найден!")
+    logging.error("TELEGRAM_TOKEN не найден!")
     exit(1)
 
 bot = Bot(token=TOKEN)
@@ -149,7 +149,6 @@ async def confirm_order(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
-    # УВЕДОМЛЕНИЕ АДМИНУ
     try:
         await bot.send_message(
             admin_id,
@@ -266,7 +265,7 @@ async def finish_booking(message: types.Message, state: FSMContext):
         f"🕐 **{data['dt'].strftime('%d.%m %H:%M')}**\n"
         f"👥 **{people} человек**\n\n"
         f"{random.choice(BOOKING_THANKS)}\n"
-        f"📞 **{CAFE.get('phone', '+7 (XXX) XXX-XX-XX')}",
+        f"📞 **{CAFE.get('phone', '+7 (XXX) XXX-XX-XX')}**",
         reply_markup=MAIN_MENU,
         parse_mode="Markdown"
     )
@@ -301,7 +300,7 @@ async def fallback(message: types.Message, state: FSMContext):
 # ================== ОШИБКИ ==================
 @dp.errors_handler()
 async def errors_handler(update, exception):
-    logging.error(f"❌ Ошибка: {exception}")
+    logging.error(f"Глобальная ошибка: {exception}")
     return True
 
 # ================== WEBHOOK (Render) ==================
@@ -310,8 +309,7 @@ WEBHOOK_URL = f"https://chatbotify-2tjd.onrender.com{WEBHOOK_PATH}"
 
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
-    print(f"✅ {CAFE.get('name')} LIVE!")
-    print(f"✅ Admin: {CAFE.get('admin_chat_id')}")
+    logging.info(f"{CAFE.get('name')} запущен!")
 
 if __name__ == "__main__":
     executor.start_webhook(
