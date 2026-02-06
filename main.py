@@ -227,4 +227,296 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     msk_time = get_moscow_time().strftime("%H:%M")
-    logger.info(f"👤 /start от {user_id} 
+    logger.info(f"👤 /start от {user_id} | MSK: {msk_time}")
+
+    if is_cafe_open():
+        await message.answer(
+            f"<b>{CAFE_NAME}</b>\n\n🕐 <i>Московское время: {msk_time}</i>\n🏪 {get_work_status()}\n\n"
+            f"☕ <b>Выберите напиток:</b>",
+            reply_markup=create_menu_keyboard(),
+        )
+    else:
+        await message.answer(get_closed_message(), reply_markup=create_info_keyboard())
+
+
+@router.message(F.text.in_(set(MENU.keys())))
+async def drink_selected(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"🥤 {message.text} от {user_id}")
+
+    if not is_cafe_open():
+        await message.answer(get_closed_message(), reply_markup=create_info_keyboard())
+        return
+
+    drink = message.text
+    price = MENU[drink]
+
+    await state.set_state(OrderStates.waiting_for_quantity)
+    await state.set_data({"drink": drink, "price": price})
+
+    await message.answer(
+        f"🥤 <b>{drink}</b>\n💰 <b>{price} ₽</b>\n\n📝 <b>Сколько порций?</b>",
+        reply_markup=create_quantity_keyboard(),
+    )
+
+
+@router.message(StateFilter(OrderStates.waiting_for_quantity))
+async def process_quantity(message: Message, state: FSMContext):
+    if message.text == "🔙 Отмена":
+        await state.clear()
+        await message.answer(
+            "❌ Заказ отменён",
+            reply_markup=create_menu_keyboard() if is_cafe_open() else create_info_keyboard(),
+        )
+        return
+
+    try:
+        quantity = int(message.text[0])
+        if 1 <= quantity <= 5:
+            data = await state.get_data()
+            drink, price = data["drink"], data["price"]
+            total = price * quantity
+
+            await state.set_state(OrderStates.waiting_for_confirmation)
+            await state.update_data(quantity=quantity, total=total)
+
+            await message.answer(
+                f"🥤 <b>{drink}</b> × {quantity}\n💰 Итого: <b>{total} ₽</b>\n\n✅ Правильно?",
+                reply_markup=create_confirm_keyboard(),
+            )
+        else:
+            await message.answer("❌ Выберите от 1 до 5", reply_markup=create_quantity_keyboard())
+    except ValueError:
+        await message.answer("❌ Нажмите на кнопку", reply_markup=create_quantity_keyboard())
+
+
+@router.message(StateFilter(OrderStates.waiting_for_confirmation))
+async def process_confirmation(message: Message, state: FSMContext):
+    if message.text == "Подтвердить":
+        # Rate-limit только после реального подтверждения заказа
+        try:
+            r_client = await get_redis_client()
+            user_id = message.from_user.id
+            last_order = await r_client.get(_rate_limit_key(user_id))
+            if last_order and time.time() - float(last_order) < RATE_LIMIT_SECONDS:
+                await message.answer(
+                    "⏳ Дай мне минутку: новый заказ можно оформить чуть позже.",
+                    reply_markup=create_menu_keyboard(),
+                )
+                await r_client.aclose()
+                return
+
+            await r_client.setex(_rate_limit_key(user_id), RATE_LIMIT_SECONDS, time.time())
+            await r_client.aclose()
+        except Exception:
+            pass
+
+        data = await state.get_data()
+        drink, quantity, total = data["drink"], data["quantity"], data["total"]
+        order_id = f"order:{int(time.time())}:{message.from_user.id}"
+        order_num = order_id.split(":")[-1]
+
+        try:
+            r_client = await get_redis_client()
+            await r_client.hset(
+                order_id,
+                mapping={
+                    "user_id": message.from_user.id,
+                    "username": message.from_user.username or "N/A",
+                    "drink": drink,
+                    "quantity": quantity,
+                    "total": total,
+                    "timestamp": datetime.now().isoformat(),
+                },
+            )
+            await r_client.expire(order_id, 86400)
+            await r_client.incr("stats:total_orders")
+            await r_client.incr(f"stats:drink:{drink}")
+            await r_client.aclose()
+        except Exception:
+            pass
+
+        user_name = message.from_user.username or message.from_user.first_name or "Клиент"
+        admin_message = (
+            f"🔔 <b>НОВЫЙ ЗАКАЗ #{order_num}</b> | {CAFE_NAME}\n\n"
+            f"<b>{user_name}</b>\n"
+            f"<code>{message.from_user.id}</code>\n\n"
+            f"{drink}\n"
+            f"{quantity} порций\n"
+            f"<b>{total} ₽</b>\n\n"
+            f"<code>{CAFE_PHONE}</code>"
+        )
+
+        await message.bot.send_message(ADMIN_ID, admin_message, disable_web_page_preview=True)
+
+        await message.answer(
+            f"🎉 <b>Заказ #{order_num} принят!</b>\n\n"
+            f"🥤 {drink} × {quantity}\n"
+            f"💰 {total}₽\n\n"
+            f"📞 {CAFE_PHONE}\n⏳ Готовим!",
+            reply_markup=create_menu_keyboard(),
+        )
+        await state.clear()
+        return
+
+    if message.text == "Меню":
+        await state.clear()
+        await message.answer("☕ Меню:", reply_markup=create_menu_keyboard())
+        return
+
+    await message.answer("❌ Нажмите кнопку", reply_markup=create_confirm_keyboard())
+
+
+@router.message(F.text == "📞 Позвонить")
+async def call_phone(message: Message):
+    name = get_user_name(message)
+    if is_cafe_open():
+        text = (
+            f"{name}, буду рад помочь!\n\n"
+            f"📞 <b>Телефон {CAFE_NAME}:</b>\n<code>{CAFE_PHONE}</code>\n\n"
+            f"Если удобнее — выбери напиток в меню, я всё оформлю здесь."
+        )
+        await message.answer(text, reply_markup=create_menu_keyboard())
+    else:
+        text = (
+            f"{name}, сейчас мы закрыты, но я всё равно подскажу.\n\n"
+            f"📞 <b>Телефон {CAFE_NAME}:</b>\n<code>{CAFE_PHONE}</code>\n\n"
+            f"⏰ {get_work_status()}\n\n"
+            f"Хочешь — посмотри меню, а заказ оформим, как только откроемся."
+        )
+        await message.answer(text, reply_markup=create_info_keyboard())
+
+
+@router.message(F.text == "⏰ Часы работы")
+async def show_hours(message: Message):
+    name = get_user_name(message)
+    msk_time = get_moscow_time().strftime("%H:%M")
+    if is_cafe_open():
+        text = (
+            f"{name}, мы сейчас на месте и готовим вкусное.\n\n"
+            f"🕐 <b>Сейчас:</b> {msk_time} (МСК)\n"
+            f"🏪 {get_work_status()}\n\n"
+            f"📞 Если нужно уточнить детали: <code>{CAFE_PHONE}</code>\n"
+            f"Выбирай напиток в меню — оформлю заказ за минуту."
+        )
+        await message.answer(text, reply_markup=create_menu_keyboard())
+    else:
+        text = (
+            f"{name}, спасибо что заглянул!\n\n"
+            f"🕐 <b>Сейчас:</b> {msk_time} (МСК)\n"
+            f"🏪 {get_work_status()}\n\n"
+            f"📞 Телефон: <code>{CAFE_PHONE}</code>\n"
+            f"Пока можем показать меню — напиши /start."
+        )
+        await message.answer(text, reply_markup=create_info_keyboard())
+
+
+@router.message(Command("stats"))
+async def stats_command(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        r_client = await get_redis_client()
+        total_orders = int(await r_client.get("stats:total_orders") or 0)
+        stats_text = f"📊 <b>Статистика заказов</b>\n\nВсего заказов: <b>{total_orders}</b>\n\n"
+        for drink in MENU.keys():
+            count = int(await r_client.get(f"stats:drink:{drink}") or 0)
+            if count > 0:
+                stats_text += f"{drink}: {count}\n"
+        await r_client.aclose()
+        await message.answer(stats_text)
+    except Exception:
+        await message.answer("❌ Ошибка статистики")
+
+
+async def on_startup(bot: Bot) -> None:
+    logger.info(f"🚀 Запуск бота ({APP_VERSION})...")
+    logger.info(f"☕ Кафе: {CAFE_NAME}")
+    logger.info(f"⏰ Часы работы: {WORK_START}:00–{WORK_END}:00 (МСК)")
+    logger.info(f"⏳ Rate-limit: {RATE_LIMIT_SECONDS} сек. (после подтверждения)")
+    logger.info(f"🔗 Webhook (target): {WEBHOOK_URL}")
+
+    try:
+        r_test = redis.from_url(REDIS_URL)
+        await r_test.ping()
+        await r_test.aclose()
+        logger.info("✅ Redis подключён")
+    except Exception as e:
+        logger.error(f"❌ Redis: {e}")
+
+    try:
+        current_webhook = await bot.get_webhook_info()
+        logger.info(f"Текущий webhook: {current_webhook.url}")
+
+        await bot.set_webhook(
+            WEBHOOK_URL,
+            secret_token=WEBHOOK_SECRET,
+        )
+        logger.info("✅ Webhook (re)set выполнен")
+    except Exception as e:
+        logger.error(f"❌ Webhook ошибка: {e}")
+
+
+async def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN не найден!")
+        return
+    if not REDIS_URL:
+        logger.error("❌ REDIS_URL не найден!")
+        return
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    storage = RedisStorage.from_url(REDIS_URL)
+    dp = Dispatcher(storage=storage)
+    dp.include_router(router)
+
+    dp.startup.register(on_startup)
+
+    app = web.Application()
+
+    async def healthcheck(request: web.Request):
+        return web.json_response({"status": "healthy", "bot": "ready", "version": APP_VERSION})
+
+    app.router.add_get("/", healthcheck)
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+        handle_in_background=True,
+    ).register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    async def _on_shutdown(a: web.Application):
+        try:
+            await bot.delete_webhook()
+        except Exception:
+            pass
+        try:
+            await storage.close()
+        except Exception:
+            pass
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+        logger.info("🛑 Бот остановлен")
+
+    app.on_shutdown.append(_on_shutdown)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    logger.info(f"🌐 Сервер запущен на 0.0.0.0:{PORT}")
+    await site.start()
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
