@@ -1,16 +1,9 @@
-# =========================
-# CafeBotify — START v1.0 (CLIENT)
-# - Меню/часы из config.json (secret file в Render)
-# - Webhook (aiogram 3 + aiohttp)
-# - Rate-limit: 60 сек, ставится только после подтверждения заказа
-# =========================
-
 import os
 import json
 import logging
 import asyncio
 import time
-import re
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple
 
@@ -21,14 +14,15 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,            # <-- добавлено
+)
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.client.default import DefaultBotProperties
-
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
-
-APP_VERSION = "START v1.0 CLIENT"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,16 +46,25 @@ def _parse_work_hours(obj: Any) -> Optional[Tuple[int, int]]:
     return None
 
 
-def _read_json_file(path: str) -> Optional[Dict[str, Any]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
 def load_config() -> Dict[str, Any]:
-    default_config = {
+    """
+    Новый формат:
+    {
+      "cafes": [
+        {
+          "id": "cafe_uyut",
+          "name": "...",
+          "phone": "...",
+          "admin_chat_id": 111,
+          "work_start": 9,
+          "work_end": 21,
+          "menu": {...}
+        }
+      ]
+    }
+    """
+    default_cafe = {
+        "id": "default_cafe",
         "name": "Кофейня «Уют» ☕",
         "phone": "+7 989 273-67-56",
         "admin_chat_id": 1471275603,
@@ -75,60 +78,61 @@ def load_config() -> Dict[str, Any]:
         },
     }
 
-    # 1) Пытаемся прочитать config.json из root проекта
-    data = _read_json_file("config.json")
-    # 2) Если нет — пробуем secret file Render
-    if data is None:
-        data = _read_json_file("/etc/secrets/config.json")
+    try:
+        with open("config.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            cafes = data.get("cafes", [])
+            if cafes and isinstance(cafes, list):
+                cafe = cafes[0]  # пока работаем с первым кафе
+            else:
+                cafe = data.get("cafe", {})
 
-    if not isinstance(data, dict):
-        return default_config
+            default_cafe.update(
+                {
+                    "id": cafe.get("id", default_cafe["id"]),
+                    "name": cafe.get("name", default_cafe["name"]),
+                    "phone": cafe.get("phone", default_cafe["phone"]),
+                    "admin_chat_id": cafe.get("admin_chat_id", default_cafe["admin_chat_id"]),
+                    "menu": cafe.get("menu", default_cafe["menu"]),
+                }
+            )
 
-    cafe = data.get("cafe", {})
-    if not isinstance(cafe, dict):
-        return default_config
+            # поддержка обоих вариантов: work_hours: [9,21] или work_start/work_end
+            wh = _parse_work_hours(cafe.get("work_hours"))
+            if wh:
+                default_cafe["work_start"], default_cafe["work_end"] = wh
+            else:
+                try:
+                    ws = cafe.get("work_start", default_cafe["work_start"])
+                    we = cafe.get("work_end", default_cafe["work_end"])
+                    ws_i, we_i = int(ws), int(we)
+                    if 0 <= ws_i <= 23 and 0 <= we_i <= 23 and ws_i != we_i:
+                        default_cafe["work_start"] = ws_i
+                        default_cafe["work_end"] = we_i
+                except Exception:
+                    pass
+    except Exception:
+        # останемся на дефолте
+        pass
 
-    default_config.update(
-        {
-            "name": cafe.get("name", default_config["name"]),
-            "phone": cafe.get("phone", default_config["phone"]),
-            "admin_chat_id": cafe.get("admin_chat_id", default_config["admin_chat_id"]),
-            "menu": cafe.get("menu", default_config["menu"]),
-        }
-    )
-
-    wh = _parse_work_hours(cafe.get("work_hours"))
-    if wh:
-        default_config["work_start"], default_config["work_end"] = wh
-    else:
-        # Backward compatibility: work_start/work_end
-        try:
-            ws = cafe.get("work_start", default_config["work_start"])
-            we = cafe.get("work_end", default_config["work_end"])
-            ws_i, we_i = int(ws), int(we)
-            if 0 <= ws_i <= 23 and 0 <= we_i <= 23 and ws_i != we_i:
-                default_config["work_start"] = ws_i
-                default_config["work_end"] = we_i
-        except Exception:
-            pass
-
-    return default_config
+    return default_cafe
 
 
 cafe_config = load_config()
 
+CAFE_ID = cafe_config["id"]
 CAFE_NAME = cafe_config["name"]
 CAFE_PHONE = cafe_config["phone"]
 ADMIN_ID = int(cafe_config["admin_chat_id"])
 MENU = dict(cafe_config["menu"])
+
 WORK_START = int(cafe_config["work_start"])
 WORK_END = int(cafe_config["work_end"])
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
-
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "cafebot123")
-HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "example.onrender.com")
+HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "chatbotify-2tjd.onrender.com")
 PORT = int(os.getenv("PORT", 10000))
 
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}/webhook"
@@ -147,7 +151,6 @@ def get_moscow_time() -> datetime:
 
 
 def is_cafe_open() -> bool:
-    # START v1.0: работа “в рамках дня” (без ночных смен).
     return WORK_START <= get_moscow_time().hour < WORK_END
 
 
@@ -158,6 +161,8 @@ def get_work_status() -> str:
         return f"🟢 <b>Открыто</b> (ещё {remaining} ч.)"
     return f"🔴 <b>Закрыто</b>\n🕐 Открываемся: {WORK_START}:00 (МСК)"
 
+
+# ---------- клавиатуры ----------
 
 def create_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [[KeyboardButton(text=drink)] for drink in MENU.keys()]
@@ -191,6 +196,36 @@ def create_confirm_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+# ---------- тёплые тексты ----------
+
+WELCOME_VARIANTS = [
+    "Рад тебя видеть, {name}! Сегодня что-то классическое или попробуем новинку?",
+    "{name}, добро пожаловать! Я уже грею молоко — выбирай, что приготовить.",
+    "Заходи, {name}! Сейчас самое время для вкусного перерыва.",
+    "{name}, привет! Устроим небольшой кофейный ритуал?",
+    "Отлично, что заглянул, {name}! Давай подберём идеальный напиток под настроение.",
+]
+
+CHOICE_VARIANTS = [
+    "Отличный выбор! Такое сейчас особенно популярно.",
+    "Классика, которая никогда не подводит.",
+    "Мне тоже нравится этот вариант — не прогадаешь.",
+    "Прекрасный вкус, {name}! Это один из хитов нашего меню.",
+    "Вот это да, {name}! Любители хорошего кофе тебя поймут.",
+    "Смело! Такой выбор обычно делают настоящие ценители.",
+    "{name}, ты знаешь толк в напитках.",
+    "Звучит вкусно — уже представляю аромат.",
+]
+
+FINISH_VARIANTS = [
+    "Спасибо за заказ! Буду рад увидеть тебя снова.",
+    "Рад был помочь с выбором. Заглядывай ещё — всегда ждём.",
+    "Отличный заказ! Надеюсь, это сделает день чуточку лучше.",
+    "Спасибо, что выбрал именно нас. До следующей кофейной паузы!",
+    "Заказ готовим с заботой. Возвращайся, когда захочется повторить.",
+]
+
+
 def get_closed_message() -> str:
     menu_text = " • ".join([f"<b>{drink}</b> {price}₽" for drink, price in MENU.items()])
     return (
@@ -222,16 +257,25 @@ def _rate_limit_key(user_id: int) -> str:
     return f"rate_limit:{user_id}"
 
 
+# -------------------------
+# Пользовательский флоу
+# -------------------------
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
+    name = get_user_name(message)
     msk_time = get_moscow_time().strftime("%H:%M")
-    logger.info(f"👤 /start от {user_id} | MSK: {msk_time}")
+    logger.info(f"👤 /start от {user_id} | MSK: {msk_time} | cafe={CAFE_ID}")
+
+    welcome = random.choice(WELCOME_VARIANTS).format(name=name)
 
     if is_cafe_open():
         await message.answer(
-            f"<b>{CAFE_NAME}</b>\n\n🕐 <i>Московское время: {msk_time}</i>\n🏪 {get_work_status()}\n\n"
+            f"{welcome}\n\n"
+            f"🕐 <i>Московское время: {msk_time}</i>\n"
+            f"🏪 {get_work_status()}\n\n"
             f"☕ <b>Выберите напиток:</b>",
             reply_markup=create_menu_keyboard(),
         )
@@ -242,7 +286,8 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(F.text.in_(set(MENU.keys())))
 async def drink_selected(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    logger.info(f"🥤 {message.text} от {user_id}")
+    name = get_user_name(message)
+    logger.info(f"🥤 {message.text} от {user_id} | cafe={CAFE_ID}")
 
     if not is_cafe_open():
         await message.answer(get_closed_message(), reply_markup=create_info_keyboard())
@@ -254,7 +299,10 @@ async def drink_selected(message: Message, state: FSMContext):
     await state.set_state(OrderStates.waiting_for_quantity)
     await state.set_data({"drink": drink, "price": price})
 
+    choice_text = random.choice(CHOICE_VARIANTS).format(name=name)
+
     await message.answer(
+        f"{choice_text}\n\n"
         f"🥤 <b>{drink}</b>\n💰 <b>{price} ₽</b>\n\n📝 <b>Сколько порций?</b>",
         reply_markup=create_quantity_keyboard(),
     )
@@ -293,14 +341,14 @@ async def process_quantity(message: Message, state: FSMContext):
 @router.message(StateFilter(OrderStates.waiting_for_confirmation))
 async def process_confirmation(message: Message, state: FSMContext):
     if message.text == "Подтвердить":
-        # Rate-limit только после реального подтверждения заказа
+        # Rate-limit только после подтверждённого заказа
         try:
             r_client = await get_redis_client()
             user_id = message.from_user.id
             last_order = await r_client.get(_rate_limit_key(user_id))
             if last_order and time.time() - float(last_order) < RATE_LIMIT_SECONDS:
                 await message.answer(
-                    "⏳ Дай мне минутку: новый заказ можно оформить чуть позже.",
+                    f"⏳ Дай мне минутку: новый заказ можно оформить через {RATE_LIMIT_SECONDS} секунд после предыдущего.",
                     reply_markup=create_menu_keyboard(),
                 )
                 await r_client.aclose()
@@ -316,44 +364,57 @@ async def process_confirmation(message: Message, state: FSMContext):
         order_id = f"order:{int(time.time())}:{message.from_user.id}"
         order_num = order_id.split(":")[-1]
 
+        user_name = message.from_user.username or message.from_user.first_name or "Клиент"
+        user_id = message.from_user.id
+
+        # Сохраняем заказ в Redis (stats + детали)
         try:
             r_client = await get_redis_client()
             await r_client.hset(
                 order_id,
                 mapping={
-                    "user_id": message.from_user.id,
-                    "username": message.from_user.username or "N/A",
+                    "user_id": user_id,
+                    "username": user_name,
                     "drink": drink,
                     "quantity": quantity,
                     "total": total,
                     "timestamp": datetime.now().isoformat(),
+                    "cafe_id": CAFE_ID,
                 },
             )
             await r_client.expire(order_id, 86400)
-            await r_client.incr("stats:total_orders")
-            await r_client.incr(f"stats:drink:{drink}")
+            await r_client.incr(f"stats:{CAFE_ID}:total_orders")
+            await r_client.incr(f"stats:{CAFE_ID}:drink:{drink}")
             await r_client.aclose()
         except Exception:
             pass
 
-        user_name = message.from_user.username or message.from_user.first_name or "Клиент"
+        # Ссылка, открывающая личный чат с клиентом
+        user_link = f'<a href="tg://user?id={user_id}">{user_name}</a>'
+
         admin_message = (
             f"🔔 <b>НОВЫЙ ЗАКАЗ #{order_num}</b> | {CAFE_NAME}\n\n"
-            f"<b>{user_name}</b>\n"
-            f"<code>{message.from_user.id}</code>\n\n"
+            f"{user_link}\n"
+            f"<code>{user_id}</code>\n\n"
             f"{drink}\n"
             f"{quantity} порций\n"
             f"<b>{total} ₽</b>\n\n"
-            f"<code>{CAFE_PHONE}</code>"
+            f"Нажми на имя, чтобы открыть чат и ответить клиенту."
         )
 
-        await message.bot.send_message(ADMIN_ID, admin_message, disable_web_page_preview=True)
+        await message.bot.send_message(
+            ADMIN_ID,
+            admin_message,
+            disable_web_page_preview=True,
+        )
+
+        finish_text = random.choice(FINISH_VARIANTS)
 
         await message.answer(
             f"🎉 <b>Заказ #{order_num} принят!</b>\n\n"
             f"🥤 {drink} × {quantity}\n"
             f"💰 {total}₽\n\n"
-            f"📞 {CAFE_PHONE}\n⏳ Готовим!",
+            f"{finish_text}",
             reply_markup=create_menu_keyboard(),
         )
         await state.clear()
@@ -374,7 +435,7 @@ async def call_phone(message: Message):
         text = (
             f"{name}, буду рад помочь!\n\n"
             f"📞 <b>Телефон {CAFE_NAME}:</b>\n<code>{CAFE_PHONE}</code>\n\n"
-            f"Если удобнее — выбери напиток в меню, я всё оформлю здесь."
+            f"Если удобнее — можешь просто выбрать напиток в меню, я всё оформлю здесь."
         )
         await message.answer(text, reply_markup=create_menu_keyboard())
     else:
@@ -417,10 +478,14 @@ async def stats_command(message: Message):
         return
     try:
         r_client = await get_redis_client()
-        total_orders = int(await r_client.get("stats:total_orders") or 0)
-        stats_text = f"📊 <b>Статистика заказов</b>\n\nВсего заказов: <b>{total_orders}</b>\n\n"
+        total_orders = int(await r_client.get(f"stats:{CAFE_ID}:total_orders") or 0)
+        stats_text = (
+            f"📊 <b>Статистика заказов</b>\n"
+            f"Кафе: <b>{CAFE_NAME}</b> (id={CAFE_ID})\n\n"
+            f"Всего заказов: <b>{total_orders}</b>\n\n"
+        )
         for drink in MENU.keys():
-            count = int(await r_client.get(f"stats:drink:{drink}") or 0)
+            count = int(await r_client.get(f"stats:{CAFE_ID}:drink:{drink}") or 0)
             if count > 0:
                 stats_text += f"{drink}: {count}\n"
         await r_client.aclose()
@@ -429,11 +494,55 @@ async def stats_command(message: Message):
         await message.answer("❌ Ошибка статистики")
 
 
+# -------------------------
+# /help — оставляем, но не публикуем в меню
+# -------------------------
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    text = (
+        "Этот бот — демо-ассистент для кофейни.\n\n"
+        "Что он умеет:\n"
+        "• Показывать меню и часы работы\n"
+        "• Принимать быстрые заказы прямо в чате\n"
+        "• Отправлять уведомления администратору с данными клиента\n"
+        "• Позволять администратору сразу открыть чат с гостем\n\n"
+        "Наша фишка — тёплые ответы:\n"
+        "• Разные варианты приветствия в начале диалога\n"
+        "• Живые комментарии к выбору напитка\n"
+        "• Дружелюбные завершения заказа с приглашением вернуться\n"
+        "Бот говорит с гостем так, будто это внимательный бариста.\n\n"
+        "Для владельцев кафе:\n"
+        "• Это демо сервиса CafeBotify — «бот вместо администратора»\n"
+        "• Подключение от 2 990 ₽ в месяц за одну точку\n\n"
+        "Хотите такой бот для своей кофейни?\n"
+        "Лендинг: https://your-landing.com\n"
+        "Связаться в Telegram: @ВАШ_ЮЗЕРНЕЙМ"
+    )
+    await message.answer(text)
+
+
+# -------------------------
+# Startup / Webhook
+# -------------------------
+
+async def set_bot_commands(bot: Bot) -> None:
+    """
+    Устанавливаем только /start и /stats (для админа), без /help.
+    Команды появляются в меню Telegram через setMyCommands.[web:31][web:35]
+    """
+    commands = [
+        BotCommand(command="start", description="Запуск бота"),
+        BotCommand(command="stats", description="Статистика (для админа)"),
+    ]
+    await bot.set_my_commands(commands)
+
+
 async def on_startup(bot: Bot) -> None:
-    logger.info(f"🚀 Запуск бота ({APP_VERSION})...")
-    logger.info(f"☕ Кафе: {CAFE_NAME}")
+    logger.info("🚀 Запуск бота (START v1.0 DEMO)...")
+    logger.info(f"☕ Кафе: {CAFE_NAME} (id={CAFE_ID})")
     logger.info(f"⏰ Часы работы: {WORK_START}:00–{WORK_END}:00 (МСК)")
-    logger.info(f"⏳ Rate-limit: {RATE_LIMIT_SECONDS} сек. (после подтверждения)")
+    logger.info(f"⏳ Rate-limit: {RATE_LIMIT_SECONDS} сек. (только после подтверждения)")
     logger.info(f"🔗 Webhook (target): {WEBHOOK_URL}")
 
     try:
@@ -456,6 +565,13 @@ async def on_startup(bot: Bot) -> None:
     except Exception as e:
         logger.error(f"❌ Webhook ошибка: {e}")
 
+    # ВАЖНО: установить команды (без /help)
+    try:
+        await set_bot_commands(bot)
+        logger.info("✅ Команды бота установлены (без /help)")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки команд: {e}")
+
 
 async def main():
     if not BOT_TOKEN:
@@ -475,7 +591,7 @@ async def main():
     app = web.Application()
 
     async def healthcheck(request: web.Request):
-        return web.json_response({"status": "healthy", "bot": "ready", "version": APP_VERSION})
+        return web.json_response({"status": "healthy", "bot": "ready"})
 
     app.router.add_get("/", healthcheck)
 
