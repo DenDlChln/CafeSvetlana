@@ -1,15 +1,80 @@
-# secrets / configs
-config.json
-.env
+# =========================
+# CafeBotify .gitignore
+# (Python + aiogram + Render)
+# =========================
 
-# python
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# Если ты хранишь конфиг в репозитории (как мы делаем сейчас) —
+# НЕ игнорируй config.json
+# config.json
+# А пример-конфиг можно хранить:
+# config.example.json
+
+# Если когда-нибудь решишь НЕ коммитить реальный config.json,
+# тогда включи строку ниже и оставь !config.example.json:
+# config.json
+# !config.example.json
+
+
+# --- Python bytecode / cache ---
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+
+# --- Virtual environments ---
 .venv/
 venv/
+env/
+ENV/
 .envrc
 
-# OS
+# --- Packaging / build ---
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+*.egg
+*.whl
+
+# --- Test / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs / runtime ---
+*.log
+logs/
+*.sqlite3
+*.db
+
+# --- OS ---
 .DS_Store
+Thumbs.db
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.iml
+
+# --- Local config / tmp ---
+*.tmp
+*.swp
+*.swo
+
+# --- Render (не обязательно, но часто) ---
+# Если используешь локальные файлы деплоя/скрипты:
+# .render/
